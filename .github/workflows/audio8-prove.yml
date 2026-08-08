@@ -1,0 +1,116 @@
+name: audio8-prove
+# MODEL-LAB probe (user 2026-08-08): prove Audio8-TTS-Preview-0.6B-ONNX-INT4 (Apache-2.0, CPU-ONNX,
+# multilingual) can actually synthesise clean speech in our channel languages BEFORE landing it in the
+# main pipeline. Audio8 is NOT a drop-in ONNX worker: it ships model-files-only + a separate GitHub
+# runtime (Audio8-AI/Audio8_TTS) with setup.sh + a server, and it is VOICE-CLONING (you must register a
+# reference voice first). This job does the full round-trip on a GitHub runner (which has onnxruntime,
+# unlike the laptop) and uploads the resulting WAVs as artifacts to LISTEN to + judge quality/CPU cost.
+#
+# Everything is best-effort + logs loudly; a failure here informs the go/no-go, it does not affect any
+# live channel (this repo is isolated from content-sync-worker).
+on:
+  workflow_dispatch:
+    inputs:
+      texts:
+        description: 'Pipe-separated test lines (default = EN/DE/ES/IT/FR/NL/PL sample set)'
+        required: false
+        default: ''
+      max_new_tokens:
+        description: 'Audio8 max_new_tokens per line'
+        required: false
+        default: '256'
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # Audio8 runtime requires 3.11+
+
+      - name: System deps (ffmpeg for the reference WAV + duration probe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Clone the Audio8 ONNX runtime
+        run: |
+          git clone --depth 1 https://github.com/Audio8-AI/Audio8_TTS.git
+          echo "RUNTIME=$PWD/Audio8_TTS/onnx_runtime" >> "$GITHUB_ENV"
+          ls -la Audio8_TTS/onnx_runtime || { echo "::error::onnx_runtime dir not found — repo layout changed"; exit 1; }
+
+      - name: Download the Audio8 model (INT4 ONNX + codec + tokenizer)
+        working-directory: Audio8_TTS/onnx_runtime
+        run: |
+          python3 -m pip install -U "huggingface_hub[cli]"
+          hf download Audio8/Audio8-TTS-Preview-0.6B-ONNX-INT4 --local-dir model
+          echo "--- model files ---"; find model -maxdepth 2 -type f | sed 's/^/  /'
+
+      - name: Runtime setup (setup.sh installs onnxruntime + deps)
+        working-directory: Audio8_TTS/onnx_runtime
+        run: |
+          # setup.sh is the model card's documented install. Time it — CPU model-load cost matters for the
+          # 90-min cron budget. Fail loud if it errors (that IS the go/no-go signal).
+          time bash setup.sh 2>&1 | tail -30 || { echo "::error::setup.sh failed — Audio8 runtime does not install cleanly"; exit 1; }
+
+      - name: Make a reference voice (Audio8 is voice-cloning → needs a registered reference)
+        working-directory: Audio8_TTS/onnx_runtime
+        run: |
+          # A short, clean neutral reference. We DON'T have a curated Agyata reference yet, so synthesise a
+          # placeholder tone→speech is not possible offline; instead use espeak as a rough reference clip so
+          # the round-trip can complete. QUALITY of the clone is judged from the OUTPUT, not this reference.
+          sudo apt-get install -y --no-install-recommends espeak-ng
+          espeak-ng -w ref.wav "This is a neutral reference recording for voice registration." || true
+          ffmpeg -y -loglevel error -i ref.wav -ar 24000 -ac 1 reference.wav || cp ref.wav reference.wav
+          ls -la reference.wav
+
+      - name: Start server + register the reference voice
+        working-directory: Audio8_TTS/onnx_runtime
+        run: |
+          ( bash start_server.sh > server.log 2>&1 & ) || true
+          # wait for the server to come up (up to 120s), then register.
+          for i in $(seq 1 24); do
+            if curl -sf http://127.0.0.1:8024/ >/dev/null 2>&1 || curl -sf http://127.0.0.1:8024/api/voices >/dev/null 2>&1; then break; fi
+            sleep 5
+          done
+          echo "--- server.log tail ---"; tail -20 server.log || true
+          curl -sf http://127.0.0.1:8024/api/voices/register \
+            -F 'audio=@reference.wav' \
+            -F 'text=This is a neutral reference recording for voice registration.' \
+            -F 'name=lab_ref' -F 'overwrite=true' || echo "::warning::voice register call failed — see server.log"
+
+      - name: Synthesize the test lines (per language) + measure
+        working-directory: Audio8_TTS/onnx_runtime
+        env:
+          TEXTS: ${{ github.event.inputs.texts }}
+          MNT: ${{ github.event.inputs.max_new_tokens }}
+        run: |
+          mkdir -p outputs
+          DEFAULT='Breaking news today from around the world.|Guten Abend, hier sind die Nachrichten.|Buenas noches, estas son las noticias.|Buonasera, ecco le notizie di oggi.|Bonsoir, voici les nouvelles du jour.|Goedenavond, dit is het nieuws.|Dobry wieczor, oto wiadomosci.'
+          LINES="${TEXTS:-$DEFAULT}"
+          i=0
+          IFS='|'
+          for line in $LINES; do
+            i=$((i+1))
+            echo "=== [$i] $line ==="
+            /usr/bin/time -v bash run_infer.sh --text "$line" --voice lab_ref --max-new-tokens "${MNT:-256}" --output "outputs/line-$i.wav" 2>&1 | grep -E "Elapsed|Maximum resident|error|Error" || true
+            if [ -s "outputs/line-$i.wav" ]; then
+              dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "outputs/line-$i.wav" 2>/dev/null || echo '?')
+              echo "  -> wrote outputs/line-$i.wav (${dur}s)"
+            else
+              echo "::warning::line $i produced no WAV"
+            fi
+          done
+          echo "--- outputs ---"; ls -la outputs/
+
+      - name: Upload synthesized samples (LISTEN to judge quality)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio8-samples
+          path: |
+            Audio8_TTS/onnx_runtime/outputs/
+            Audio8_TTS/onnx_runtime/server.log
+          retention-days: 7
+          if-no-files-found: warn
