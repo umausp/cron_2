@@ -1,0 +1,97 @@
+name: chatterbox-prove
+# MODEL-LAB probe (user 2026-08-30): prove Chatterbox Multilingual V3 (MIT license, 23 languages incl.
+# Hindi) runs on a CPU-ONLY GitHub runner at an acceptable REAL-TIME FACTOR, BEFORE it lands in the
+# content-sync-worker pipeline as a flagged TTS engine to replace the robotic / throttled edge voices on
+# the 9 native channels (esp. the still-robotic hi-IN-SwaraNeural) — Phase 2 of the voice-naturalness
+# initiative. All 9 native edge langs are covered by the 23: hi/es/ja/nl/sv/no/da/fi/pl.
+#
+# Zero-shot BASELINE (no reference clip): judges the model's own default voice + CPU cost. Best-effort +
+# logs loudly; a failure here is the go/no-go signal and touches NO live channel (this repo is isolated).
+# Green + good-sounding samples + a workable RTF = go; then a flagged Chatterbox engine lands in the
+# pipeline and the weakest edge channels repoint to it, weakest-first (hi).
+on:
+  workflow_dispatch:
+    inputs:
+      lines:
+        description: "Pipe-separated lang:text pairs (default = hi/es/ja/nl/en news set)"
+        required: false
+        default: ""
+      t3_model:
+        description: "Chatterbox T3 checkpoint (v3 = latest multilingual, v2 = legacy)"
+        required: false
+        default: "v3"
+      preset:
+        description: "Base delivery preset (news=steady anchor / neutral=model default / hook / stakes / meaning)"
+        required: false
+        default: "news"
+      delivery_demo:
+        description: "Lang to also render under ALL beat-role presets (hook/stakes/meaning/news) to HEAR the per-beat dynamism; blank = skip"
+        required: false
+        default: "hi"
+      seed:
+        description: "Fixed random seed (reproducible A/B + consistent voice across beats)"
+        required: false
+        default: "0"
+      exaggeration:
+        description: "Override exaggeration (blank = use preset; 0.5 default, ~0.7 expressive, HIGHER also speeds up)"
+        required: false
+        default: ""
+      cfg_weight:
+        description: "Override cfg_weight/PACE (blank = use preset; 0.5 default, LOWER ~0.3 = slower/deliberate)"
+        required: false
+        default: ""
+      temperature:
+        description: "Override temperature (blank = use preset; 0.8 default, lower = steadier)"
+        required: false
+        default: ""
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # chatterbox-tts 0.1.7 wants 3.11
+
+      - name: System deps (ffmpeg + libsndfile for wav I/O; espeak-ng for any g2p fallback)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg espeak-ng libsndfile1
+
+      - name: Install CPU torch FIRST (skip the ~2.5GB CUDA wheel the runner can't use), then chatterbox
+        run: |
+          python3 -m pip install -U pip
+          # chatterbox-tts 0.1.7 pins torch/torchaudio 2.6.0; take those from the CPU index so from_pretrained
+          # loads a CPU build (the runner has no GPU). chatterbox then installs without re-pulling torch.
+          pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install chatterbox-tts==0.1.7
+          python3 -c "import torch; assert not torch.cuda.is_available(); print('torch', torch.__version__, 'CPU build OK')"
+
+      - name: Prove — synth per language on CPU, measure load + per-line RTF + peak RAM
+        env:
+          CBX_DEVICE: cpu
+          CBX_LINES: ${{ github.event.inputs.lines }}
+          CBX_T3: ${{ github.event.inputs.t3_model }}
+          CBX_PRESET: ${{ github.event.inputs.preset }}
+          CBX_DELIVERY_DEMO: ${{ github.event.inputs.delivery_demo }}
+          CBX_SEED: ${{ github.event.inputs.seed }}
+          CBX_EXAG: ${{ github.event.inputs.exaggeration }}
+          CBX_CFG: ${{ github.event.inputs.cfg_weight }}
+          CBX_TEMP: ${{ github.event.inputs.temperature }}
+          # keep torch threads matched to the runner's 4 vCPU (default already, but explicit for the RTF read)
+          OMP_NUM_THREADS: "4"
+        run: |
+          # /usr/bin/time -v gives "Maximum resident set size" — proves the 0.5B model fits the runner's RAM.
+          /usr/bin/time -v python3 chatterbox_prove.py || { echo "::error::chatterbox_prove.py failed"; exit 1; }
+
+      - name: Upload samples + metrics (LISTEN to the WAVs + read RTF in metrics.json to judge)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatterbox-samples
+          path: outputs/
+          retention-days: 7
+          if-no-files-found: warn
