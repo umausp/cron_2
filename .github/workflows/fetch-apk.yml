@@ -1,0 +1,22 @@
+name: Fetch TikTok APK
+on:
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  download-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install apkeep
+        run: |
+          wget https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O apkeep
+          chmod +x apkeep
+          sudo mv apkeep /usr/local/bin/
+
+      - name: Download APK from APKPure
+        run: apkeep -a com.zhiliaoapp.musically -d apkpure .
+
+      - name: Upload APK as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-latest-apk
+          path: com.zhiliaoapp.musically.apk
