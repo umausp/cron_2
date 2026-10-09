@@ -1,6 +1,6 @@
 name: Fetch TikTok APK
 on:
-  workflow_dispatch: # Allows manual trigger
+  workflow_dispatch: # This allows you to trigger it manually via a button
 
 jobs:
   download-apk:
@@ -13,10 +13,12 @@ jobs:
           sudo mv apkeep /usr/local/bin/
 
       - name: Download APK from APKPure
-        run: apkeep -a com.zhiliaoapp.musically -d apkpure .
+        # Corrected the download source to 'apk-pure'
+        run: apkeep -a com.zhiliaoapp.musically -d apk-pure .
 
       - name: Upload APK as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: tiktok-latest-apk
-          path: com.zhiliaoapp.musically.apk
+          # Using a wildcard ensures we grab it even if apkeep appends a version number
+          path: "*.apk"
